@@ -1,9 +1,19 @@
+
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { useParams, useNavigate, Link } from 'react-router-dom';
 import { supabase } from '../lib/supabase';
 import { Album, Photo } from '../types';
 import { useAuth, useToast } from '../App';
-import { Button, Input, Textarea, Spinner, TrashIcon, EditIcon, PlusIcon, LogoutIcon, StarIcon, CameraIcon } from '../components/ui';
+import { Button, Input, Textarea, Spinner, TrashIcon, EditIcon, PlusIcon, LogoutIcon, StarIcon, CameraIcon, CloseIcon } from '../components/ui';
+
+// --- Type for upload queue item ---
+interface UploadableFile {
+  id: string;
+  file: File;
+  previewUrl: string;
+  status: 'queued' | 'uploading' | 'success' | 'error';
+  error?: string;
+}
 
 // --- Reusable Admin Layout ---
 const AdminLayout: React.FC<{ children: React.ReactNode }> = ({ children }) => {
@@ -148,7 +158,7 @@ export const AdminDashboardPage: React.FC = () => {
 
             // Delete from storage
             if (photos && photos.length > 0) {
-                const filePaths = photos.map(p => p.image_url.split('/').pop() as string).filter(Boolean);
+                const filePaths = photos.map(p => p.image_url.split('/gallery/').pop() as string).filter(Boolean);
                 if (filePaths.length > 0) {
                   const { error: storageError } = await supabase.storage.from('gallery').remove(filePaths);
                   if (storageError) {
@@ -231,7 +241,8 @@ export const AdminAlbumEditorPage: React.FC = () => {
     const [captions, setCaptions] = useState<Record<string, string>>({});
     const [loading, setLoading] = useState(!isNew);
     const [saving, setSaving] = useState(false);
-    const [uploading, setUploading] = useState(false);
+    const [isDragging, setIsDragging] = useState(false);
+    const [filesToUpload, setFilesToUpload] = useState<UploadableFile[]>([]);
     const fileInputRef = useRef<HTMLInputElement>(null);
 
     const fetchAlbumData = useCallback(async () => {
@@ -268,6 +279,13 @@ export const AdminAlbumEditorPage: React.FC = () => {
         fetchAlbumData();
     }, [fetchAlbumData]);
     
+    // Cleanup for Object URLs to prevent memory leaks
+    useEffect(() => {
+      return () => {
+        filesToUpload.forEach(f => URL.revokeObjectURL(f.previewUrl));
+      }
+    }, [filesToUpload]);
+
     const handleAlbumSave = async () => {
         if (!album.title) {
             addToast('Judul album tidak boleh kosong.', 'error');
@@ -301,44 +319,107 @@ export const AdminAlbumEditorPage: React.FC = () => {
         setSaving(false);
     };
 
-    const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-        const files = e.target.files;
-        if (!files || files.length === 0 || !albumId) return;
+    const handleFileSelect = (selectedFiles: FileList | null) => {
+      if (!selectedFiles) return;
 
-        setUploading(true);
-        const uploadPromises = Array.from(files).map(async (file: File) => {
-            const fileName = `${Date.now()}-${file.name.replace(/\s/g, '_')}`;
+      // FIX: Explicitly type the return of the map callback to `UploadableFile | null` to guide TypeScript's inference.
+      const newFiles: UploadableFile[] = Array.from(selectedFiles).map((file): UploadableFile | null => {
+          if (!file.type.startsWith('image/')) {
+              addToast(`File ${file.name} bukan gambar.`, 'error');
+              return null;
+          }
+          if (file.size > 5 * 1024 * 1024) { // 5MB limit
+              addToast(`File ${file.name} terlalu besar (> 5MB).`, 'error');
+              return null;
+          }
+          return {
+              id: crypto.randomUUID(),
+              file,
+              previewUrl: URL.createObjectURL(file),
+              status: 'queued',
+          };
+      }).filter((f): f is UploadableFile => f !== null);
+
+      setFilesToUpload(prev => [...prev, ...newFiles]);
+       if(fileInputRef.current) fileInputRef.current.value = "";
+    };
+
+    const removeFileFromQueue = (id: string) => {
+      setFilesToUpload(prev => {
+        const fileToRemove = prev.find(f => f.id === id);
+        if (fileToRemove) {
+          URL.revokeObjectURL(fileToRemove.previewUrl);
+        }
+        return prev.filter(f => f.id !== id);
+      });
+    };
+    
+    const handleUploadAll = async () => {
+      if (!albumId) return;
+
+      const filesToProcess = filesToUpload.filter(f => f.status === 'queued');
+      if (filesToProcess.length === 0) {
+        addToast('Tidak ada foto dalam antrean.', 'info');
+        return;
+      }
+      
+      // Set status to 'uploading'
+      setFilesToUpload(prev => prev.map(f => f.status === 'queued' ? {...f, status: 'uploading'} : f));
+
+      let successCount = 0;
+      let errorCount = 0;
+
+      for (const uploadableFile of filesToProcess) {
+        try {
+            const file = uploadableFile.file;
+            const fileName = `${crypto.randomUUID()}-${file.name.replace(/\s/g, '_')}`;
+            
             const { error: uploadError } = await supabase.storage.from('gallery').upload(fileName, file);
             if (uploadError) throw uploadError;
 
             const { data: urlData } = supabase.storage.from('gallery').getPublicUrl(fileName);
-            return { image_url: urlData.publicUrl, album_id: albumId };
-        });
-
-        try {
-            const newPhotosData = await Promise.all(uploadPromises);
-            const { error: insertError } = await supabase.from('photos').insert(newPhotosData);
+            const { error: insertError } = await supabase.from('photos').insert({ image_url: urlData.publicUrl, album_id: albumId });
             if (insertError) throw insertError;
-
-            addToast(`${files.length} foto berhasil diunggah.`, 'success');
-            fetchAlbumData(); // Refresh photos
-        } catch (error) {
-            let errorMessage = 'Terjadi kesalahan yang tidak diketahui';
-            if (error instanceof Error) {
-                errorMessage = error.message;
-            } else if (error && typeof error === 'object' && 'message' in error) {
-                errorMessage = String((error as { message: unknown }).message);
-            }
-            addToast('Gagal mengunggah foto: ' + errorMessage, 'error');
-        } finally {
-            setUploading(false);
-            if(fileInputRef.current) fileInputRef.current.value = "";
+            
+            setFilesToUpload(prev => prev.map(f => f.id === uploadableFile.id ? {...f, status: 'success'} : f));
+            successCount++;
+        } catch (error: any) {
+            errorCount++;
+            setFilesToUpload(prev => prev.map(f => f.id === uploadableFile.id ? {...f, status: 'error', error: error.message} : f));
         }
+      }
+
+      if (successCount > 0) {
+        addToast(`${successCount} foto berhasil diunggah.`, 'success');
+        fetchAlbumData(); // Refresh photo list
+      }
+      if (errorCount > 0) {
+        addToast(`${errorCount} foto gagal diunggah.`, 'error');
+      }
+      // Clear successful uploads from queue after a delay
+      setTimeout(() => {
+        setFilesToUpload(prev => prev.filter(f => f.status !== 'success'));
+      }, 3000);
     };
-    
+
+    // Drag and drop handlers
+    const handleDragOver = (e: React.DragEvent<HTMLDivElement>) => {
+      e.preventDefault();
+      setIsDragging(true);
+    };
+    const handleDragLeave = (e: React.DragEvent<HTMLDivElement>) => {
+      e.preventDefault();
+      setIsDragging(false);
+    };
+    const handleDrop = (e: React.DragEvent<HTMLDivElement>) => {
+      e.preventDefault();
+      setIsDragging(false);
+      handleFileSelect(e.dataTransfer.files);
+    };
+
     const handleDeletePhoto = async (photo: Photo) => {
         if (window.confirm('Anda yakin ingin menghapus foto ini?')) {
-            const filePath = photo.image_url.split('/').pop();
+            const filePath = photo.image_url.split('/gallery/').pop();
             if(!filePath) {
                  addToast('URL foto tidak valid.', 'error');
                  return;
@@ -372,6 +453,8 @@ export const AdminAlbumEditorPage: React.FC = () => {
             setAlbum(prev => ({ ...prev, cover_image_url: photoUrl }));
         }
     };
+    
+    const isUploading = filesToUpload.some(f => f.status === 'uploading');
 
     if (loading) {
         return <AdminLayout><div className="flex justify-center"><Spinner /></div></AdminLayout>
@@ -392,7 +475,7 @@ export const AdminAlbumEditorPage: React.FC = () => {
                      <h2 className="text-xl font-semibold">Detail Album</h2>
                      <div>
                         <label className="block text-sm font-medium text-gray-700">Judul</label>
-                        <Input value={album.title} onChange={(e) => setAlbum({...album, title: e.target.value})} />
+                        <Input value={album.title || ''} onChange={(e) => setAlbum({...album, title: e.target.value})} />
                      </div>
                      <div>
                         <label className="block text-sm font-medium text-gray-700">Deskripsi</label>
@@ -405,14 +488,50 @@ export const AdminAlbumEditorPage: React.FC = () => {
                     <h2 className="text-xl font-semibold mb-4">Manajemen Foto</h2>
                     {!isNew ? (
                         <>
-                        <div className="border-2 border-dashed border-gray-300 rounded-lg p-6 text-center mb-6">
-                            <input type="file" multiple onChange={handleFileUpload} ref={fileInputRef} className="hidden" id="photo-upload" />
-                            <label htmlFor="photo-upload" className="cursor-pointer text-brand-blue-600 font-semibold">
-                                {uploading ? 'Mengunggah...' : 'Pilih atau jatuhkan file untuk diunggah'}
+                        <div 
+                          className={`border-2 border-dashed rounded-lg p-6 text-center mb-6 transition-colors ${isDragging ? 'border-brand-blue-500 bg-brand-blue-50' : 'border-gray-300'}`}
+                          onDragOver={handleDragOver}
+                          onDragLeave={handleDragLeave}
+                          onDrop={handleDrop}
+                        >
+                            <input type="file" multiple onChange={(e) => handleFileSelect(e.target.files)} ref={fileInputRef} className="hidden" id="photo-upload" accept="image/*" />
+                            <label htmlFor="photo-upload" className="cursor-pointer text-brand-blue-600 font-semibold flex flex-col items-center justify-center space-y-2">
+                                <CameraIcon className="w-12 h-12 text-gray-400" />
+                                <span>{isDragging ? 'Jatuhkan file di sini' : 'Pilih file atau jatuhkan ke sini'}</span>
+                                <span className="text-xs text-gray-500">Maks 5MB per file</span>
                             </label>
-                            {uploading && <div className="mt-4 flex justify-center"><Spinner /></div>}
                         </div>
                         
+                        {/* Upload Queue */}
+                        {filesToUpload.length > 0 && (
+                          <div className="mb-6">
+                            <h3 className="font-semibold text-lg mb-2">Antrean Unggah ({filesToUpload.filter(f => f.status === 'queued').length})</h3>
+                            <div className="space-y-2 max-h-60 overflow-y-auto pr-2">
+                              {filesToUpload.map(f => (
+                                <div key={f.id} className="flex items-center p-2 bg-gray-50 rounded-md">
+                                  <img src={f.previewUrl} alt={f.file.name} className="w-12 h-12 object-cover rounded-md mr-3" />
+                                  <div className="flex-grow">
+                                    <p className="text-sm font-medium truncate">{f.file.name}</p>
+                                    <p className="text-xs text-gray-500">{(f.file.size / 1024 / 1024).toFixed(2)} MB</p>
+                                    {f.status === 'error' && <p className="text-xs text-red-500 truncate" title={f.error}>{f.error}</p>}
+                                  </div>
+                                  <div className="flex items-center space-x-2 ml-2">
+                                    {f.status === 'queued' && <span className="text-xs font-semibold text-gray-500">Menunggu</span>}
+                                    {f.status === 'uploading' && <Spinner />}
+                                    {f.status === 'success' && <span className="text-xs font-semibold text-green-500">Berhasil</span>}
+                                    {f.status === 'error' && <span className="text-xs font-semibold text-red-500">Gagal</span>}
+                                    <button onClick={() => removeFileFromQueue(f.id)} disabled={f.status === 'uploading'} className="p-1 text-gray-500 hover:text-red-600 disabled:opacity-50"><CloseIcon className="w-4 h-4" /></button>
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+                            <Button onClick={handleUploadAll} disabled={isUploading || filesToUpload.filter(f => f.status === 'queued').length === 0} className="w-full mt-4">
+                              {isUploading ? <Spinner/> : `Unggah ${filesToUpload.filter(f => f.status === 'queued').length} Foto`}
+                            </Button>
+                          </div>
+                        )}
+
+                        <h3 className="font-semibold text-lg mb-2 mt-4">Foto Tersimpan</h3>
                         <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-4">
                             {photos.map(photo => (
                                 <div key={photo.id} className="relative group bg-gray-100 rounded-md overflow-hidden">
