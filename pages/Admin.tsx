@@ -1,4 +1,3 @@
-
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { useParams, useNavigate, Link } from 'react-router-dom';
 import { supabase } from '../lib/supabase';
@@ -363,40 +362,54 @@ export const AdminAlbumEditorPage: React.FC = () => {
         return;
       }
       
-      // Set status to 'uploading'
+      // Set status to 'uploading' for all queued files
       setFilesToUpload(prev => prev.map(f => f.status === 'queued' ? {...f, status: 'uploading'} : f));
-
-      let successCount = 0;
-      let errorCount = 0;
-
-      for (const uploadableFile of filesToProcess) {
+      
+      // Map each file to an upload promise
+      const uploadPromises = filesToProcess.map(async (uploadableFile) => {
         try {
             const file = uploadableFile.file;
             const fileName = `${crypto.randomUUID()}-${file.name.replace(/\s/g, '_')}`;
             
             const { error: uploadError } = await supabase.storage.from('gallery').upload(fileName, file);
-            if (uploadError) throw uploadError;
+            if (uploadError) throw new Error(`Storage error: ${uploadError.message}`);
 
             const { data: urlData } = supabase.storage.from('gallery').getPublicUrl(fileName);
-            const { error: insertError } = await supabase.from('photos').insert({ image_url: urlData.publicUrl, album_id: albumId });
-            if (insertError) throw insertError;
-            
+            if (!urlData.publicUrl) throw new Error("Could not get public URL for the uploaded file.");
+
             setFilesToUpload(prev => prev.map(f => f.id === uploadableFile.id ? {...f, status: 'success'} : f));
-            successCount++;
+            return { image_url: urlData.publicUrl, album_id: albumId as string };
         } catch (error: any) {
-            errorCount++;
             setFilesToUpload(prev => prev.map(f => f.id === uploadableFile.id ? {...f, status: 'error', error: error.message} : f));
+            return null;
+        }
+      });
+      
+      const results = await Promise.all(uploadPromises);
+      
+      const successfulUploads = results.filter((result): result is { image_url: string; album_id: string } => result !== null);
+      const errorCount = filesToProcess.length - successfulUploads.length;
+
+      // Perform a single bulk insert to the database
+      if (successfulUploads.length > 0) {
+        const { error: insertError } = await supabase.from('photos').insert(successfulUploads);
+        
+        if (insertError) {
+          addToast(`Gagal menyimpan foto ke database: ${insertError.message}`, 'error');
+          setFilesToUpload(prev => prev.map(f => {
+              if (f.status === 'success') return {...f, status: 'error', error: 'DB insert failed'};
+              return f;
+          }));
+        } else {
+          addToast(`${successfulUploads.length} foto berhasil diunggah.`, 'success');
+          fetchAlbumData();
         }
       }
 
-      if (successCount > 0) {
-        addToast(`${successCount} foto berhasil diunggah.`, 'success');
-        fetchAlbumData(); // Refresh photo list
-      }
       if (errorCount > 0) {
         addToast(`${errorCount} foto gagal diunggah.`, 'error');
       }
-      // Clear successful uploads from queue after a delay
+      
       setTimeout(() => {
         setFilesToUpload(prev => prev.filter(f => f.status !== 'success'));
       }, 3000);
